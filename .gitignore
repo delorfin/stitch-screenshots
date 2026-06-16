@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Stitcher output / debug artifacts
+debug_seams/
+*-stitched.png
+stitched.png
+stitched-*.png
+
+# OS
+.DS_Store
+._*
