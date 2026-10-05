@@ -38,6 +38,14 @@ def setup_logging(verbose: bool = False):
 
 # ---------- IO / small helpers ----------
 
+def imread_alpha(path: str, crop_right: int = 0, crop_bottom: int = 0):
+    """The image's alpha channel (cropped like the image), or None if opaque."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None or img.ndim != 3 or img.shape[2] != 4:
+        return None
+    alpha = apply_crop(img[:, :, 3], crop_right, crop_bottom)
+    return None if (alpha == 255).all() else np.ascontiguousarray(alpha)
+
 def imread_rgb(path: str) -> np.ndarray:
     """Load image as 3-channel BGR (drops alpha, expands grayscale)."""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -231,20 +239,41 @@ def detect_alignment(prev: np.ndarray, curr: np.ndarray,
     def strips(off):
         return pg[h1 - off:h1, :], cg[0:off, :]
 
-    off_step, sh_step, rstep = (3, 2, 2) if coarse else (1, 1, 1)
-    offs = list(range(min_overlap, max_search + 1, off_step))
-    if offs[-1] != max_search:
-        offs.append(max_search)
-    coarse_shifts = list(range(-max_shift, max_shift + 1, sh_step)) if enable_shift else [0]
+    # Coarse pass. Tall frames are searched on a downscaled copy (every offset at
+    # 1/f scale); small ones with a strided full-res search.
+    f = (4 if min(h1, h2) >= 800 else 2 if min(h1, h2) >= 400 else 1) if coarse else 1
+    if f > 1 and max_search // f < -(-min_overlap // f):
+        f = 1                                            # range too narrow to downscale
+    if f > 1:
+        ps = cv2.resize(pg, (pg.shape[1] // f, h1 // f), interpolation=cv2.INTER_AREA)
+        cs = cv2.resize(cg, (cg.shape[1] // f, h2 // f), interpolation=cv2.INTER_AREA)
+        hs1 = ps.shape[0]
+        lo, hi = -(-min_overlap // f), max_search // f
+        ms = max_shift // f if enable_shift else 0
+        best = (float('inf'), 0, lo)
+        for off in range(lo, hi + 1):
+            r1, r2 = ps[hs1 - off:hs1, :], cs[0:off, :]
+            for sh in range(-ms, ms + 1):
+                m = _strip_mse(r1, r2, sh, 1)
+                if m < best[0]:
+                    best = (m, sh, off)
+        _, c_sh, c_off = best[0], best[1] * f, best[2] * f
+        off_step = sh_step = 2 * f                       # refine window: +-2 coarse px
+    else:
+        off_step, sh_step, rstep = (3, 2, 2) if coarse else (1, 1, 1)
+        offs = list(range(min_overlap, max_search + 1, off_step))
+        if offs[-1] != max_search:
+            offs.append(max_search)
+        coarse_shifts = list(range(-max_shift, max_shift + 1, sh_step)) if enable_shift else [0]
 
-    best = (float('inf'), 0, min_overlap)  # (mse, shift, overlap)
-    for off in offs:
-        r1, r2 = strips(off)
-        for sh in coarse_shifts:
-            m = _strip_mse(r1, r2, sh, rstep)
-            if m < best[0]:
-                best = (m, sh, off)
-    _, c_sh, c_off = best
+        best = (float('inf'), 0, min_overlap)  # (mse, shift, overlap)
+        for off in offs:
+            r1, r2 = strips(off)
+            for sh in coarse_shifts:
+                m = _strip_mse(r1, r2, sh, rstep)
+                if m < best[0]:
+                    best = (m, sh, off)
+        _, c_sh, c_off = best
 
     # refine around the coarse optimum at full row resolution
     off_lo, off_hi = max(min_overlap, c_off - off_step), min(max_search, c_off + off_step)
@@ -375,6 +404,198 @@ def detect_sticky_bands(imgs, max_frac: float = 0.4, tol: float = 25.0,
     bh = band_height(lambda g: g[g.shape[0] - B:][::-1])
     return th, bh
 
+# ---------- scrolling-region detection ----------
+
+def detect_motion_box(imgs, tol: int = 16, min_frac: float = 0.1):
+    """Find the region whose pixels change between frames — the scrolling area.
+
+    For whole-window captures: toolbars, sidebars and fixed headers stay put
+    while the scrolled content moves. Returns (y0, y1, x0, x1) in real image
+    coords, or None if frames differ in size or nothing changed.
+
+    Changed pixels (any adjacent pair, gray diff > `tol`) are closed into blobs;
+    blobs smaller than `min_frac` of the largest (a spinner, a blinking cursor)
+    are dropped, and the box spans the rest. Blank margins inside the scrolling
+    area never change, so they fall outside the box.
+    """
+    if len(imgs) < 2 or any(im.shape != imgs[0].shape for im in imgs):
+        return None
+    H, W = imgs[0].shape[:2]
+    grays = [gray(im) for im in imgs]
+    mask = np.zeros((H, W), np.uint8)
+    for a, b in zip(grays, grays[1:]):
+        mask[cv2.absdiff(a, b) > tol] = 255
+    if not mask.any():
+        return None
+    k = max(3, min(H, W) // 20) | 1        # odd, so the closing doesn't shift the box
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    comps = stats[1:]
+    comps = comps[comps[:, cv2.CC_STAT_AREA] >= comps[:, cv2.CC_STAT_AREA].max() * min_frac]
+    x0 = int(comps[:, cv2.CC_STAT_LEFT].min())
+    y0 = int(comps[:, cv2.CC_STAT_TOP].min())
+    x1 = int((comps[:, cv2.CC_STAT_LEFT] + comps[:, cv2.CC_STAT_WIDTH]).max())
+    y1 = int((comps[:, cv2.CC_STAT_TOP] + comps[:, cv2.CC_STAT_HEIGHT]).max())
+    return y0, y1, x0, x1
+
+def apply_fixed_cols(box, fixed_cols, width: int):
+    """Shrink the scrolling region's columns to exclude declared fixed UI.
+
+    `fixed_cols` are (a, b) column ranges, e.g. a scrollbar reported by the OS.
+    A range in the region's right half moves its right edge in; one in the left
+    half moves its left edge in. Ranges outside the region change nothing.
+    Returns (box, ranges that applied).
+    """
+    y0, y1, x0, x1 = box
+    applied = []
+    for a, b in fixed_cols:
+        a, b = max(0, a), min(width, b)
+        if b <= x0 or a >= x1 or a >= b:
+            continue
+        nx0, nx1 = (x0, min(x1, a)) if a > (x0 + x1) / 2 else (max(x0, b), x1)
+        if nx1 - nx0 < 10:
+            logging.warning(f"--fixed-cols {a}:{b} would leave no scrolling region; ignored")
+            continue
+        x0, x1 = nx0, nx1
+        applied.append((a, b))
+    return (y0, y1, x0, x1), applied
+
+def transparent_rows(alpha, from_end: bool = False) -> int:
+    """Rows at the top (or bottom) edge that contain any transparency — the
+    window's rounded corners in a macOS window capture."""
+    if alpha is None:
+        return 0
+    opaque = (alpha == 255).all(axis=1)
+    if from_end:
+        opaque = opaque[::-1]
+    idx = np.where(opaque)[0]
+    # no opaque row at all (a translucent window) or a deep band: not corners
+    if not idx.size or idx[0] > len(opaque) // 8:
+        return 0
+    return int(idx[0])
+
+def panes(strip: np.ndarray, tol: int = 20):
+    """Split a side strip into panes where the background colour changes
+    (a grey sidebar next to a white list), as [start, end) column ranges."""
+    med = np.median(strip, axis=0).astype(np.int16)              # (w, 3)
+    cuts = np.flatnonzero(np.abs(np.diff(med, axis=0)).max(axis=1) > tol) + 1
+    bounds = [0, *cuts.tolist(), strip.shape[1]]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+def pinned_bottom(strip: np.ndarray, zone: float = 0.15, min_gap: float = 0.05,
+                  tol: int = 12) -> int:
+    """Row where a pane's bottom-pinned controls start, or the strip height.
+
+    Pinned controls (a "..." button at a sidebar's foot) sit in the bottom
+    `zone` of the pane, below a band of empty rows at least `min_gap` of its
+    height. Content that runs to the bottom (a list) has no such band, so it
+    stays in place and nothing is moved.
+    """
+    vh = strip.shape[0]
+    g = gray(strip).astype(np.int16)
+    flat = np.r_[False, (g.max(axis=1) - g.min(axis=1)) <= tol, False]
+    edges = np.flatnonzero(np.diff(flat.astype(np.int8)))
+    starts, ends = edges[::2], edges[1::2]          # empty-row runs [start, end)
+    need = max(8, int(vh * min_gap))
+    ok = (ends - starts >= need) & (ends >= vh * (1 - zone)) & (ends < vh)
+    return int(ends[ok].max()) if ok.any() else vh
+
+def compose_window(first: np.ndarray, last: np.ndarray, body: np.ndarray, box,
+                   a_first=None, a_last=None, blank_cols=()):
+    """Put the fixed UI back around the stitched scrolling region, once.
+
+    Top band from the first frame, bottom band from the last (its end state).
+    Side columns come from the first frame only, followed by each column's
+    median (its background) to fill the extra height. Exception: controls
+    pinned to a pane's bottom, below a band of empty space, are moved to the
+    bottom (see `pinned_bottom`). `blank_cols` (a declared scrollbar)
+    are filled with their median throughout: with all content shown, there is
+    nothing left to scroll. With alphas given, the window's top and bottom rows
+    (rounded corners) are copied from the first and last frame with their
+    transparency. Returns (bgr, alpha); alpha is None when there's nothing
+    transparent to keep.
+    """
+    y0, y1, x0, x1 = box
+    bh = body.shape[0]
+    # side rows inside the window's transparent bottom corners; the real corners
+    # are restored from the last frame below
+    corner = max(0, y1 - (first.shape[0] - transparent_rows(a_first, from_end=True)))
+
+    def side(c0, c1):
+        sf, sl = first[y0:y1, c0:c1], last[y0:y1, c0:c1]
+        vh, w = sf.shape[:2]
+        if w == 0:
+            return np.zeros((bh, 0, 3), np.uint8)
+        fill = np.median(sf, axis=0).astype(np.uint8)[None]   # (1, w, 3)
+        if bh <= vh:
+            out = sf[:bh].copy()
+        else:
+            src = sf[:max(1, vh - corner)]
+            parts = []
+            for p0, p1 in panes(src):              # each pane decides on its own
+                pane, pfill = src[:, p0:p1], fill[:, p0:p1]
+                split = pinned_bottom(pane) if p1 - p0 >= 8 else len(pane)
+                # the dropped corner rows go back as filler at the very bottom
+                # (overwritten by the restored corners), keeping pinned controls
+                # at their distance from the window's edge
+                parts.append(np.vstack([pane[:split], np.repeat(pfill, bh - vh, axis=0),
+                                        pane[split:], np.repeat(pfill, vh - len(pane), axis=0)]))
+            out = np.hstack(parts)
+        if blank_cols:
+            # track colour: the thumb starts at the top of the first frame and
+            # ends at the bottom of the last, so these quarters show the track
+            track = np.median(np.vstack([sf[3 * vh // 4:], sl[:max(1, vh // 4)]]),
+                              axis=0).astype(np.uint8)[None]
+            for a, b in blank_cols:
+                a, b = max(a, c0) - c0, min(b, c1) - c0
+                if a < b:
+                    out[:, a:b] = track[:, a:b]
+        return out
+
+    mid = np.hstack([side(0, x0), body, side(x1, first.shape[1])])
+    W = mid.shape[1]
+
+    def fit(band):                             # body may be wider if frames drifted
+        if band.shape[1] < W:
+            return cv2.copyMakeBorder(band, 0, 0, 0, W - band.shape[1], cv2.BORDER_REPLICATE)
+        return band[:, :W]
+
+    top = [fit(first[:y0])] if y0 > 0 else []
+    bottom = [fit(last[y1:])] if last.shape[0] > y1 else []
+    out = np.vstack(top + [mid] + bottom)
+
+    k = transparent_rows(a_first)
+    m = transparent_rows(a_last, from_end=True)
+    if not (k or m) or W != first.shape[1] or out.shape[0] < k + m:
+        return out, None
+    # The output's first rows are the first frame's, its last rows the last
+    # frame's; restoring them restores the rounded corners exactly.
+    alpha = np.full(out.shape[:2], 255, np.uint8)
+    if k:
+        out[:k], alpha[:k] = first[:k], a_first[:k]
+    if m:
+        out[-m:], alpha[-m:] = last[-m:], a_last[-m:]
+    return out, alpha
+
+def seam_row(prev_ov: np.ndarray, curr_ov: np.ndarray, band: int = 64) -> int:
+    """Row of the overlap to cut at for --prefer middle.
+
+    Searches the overlap, minus a margin at each end, for the row where the two frames agree
+    best across a band of rows around it, so content that changed between the
+    captures (an animation) is taken whole from one frame instead of being cut
+    through. Ties go to the exact middle, so identical frames cut there.
+    """
+    O = prev_ov.shape[0]
+    q = max(O // 16, min(48, O // 4))       # margin: clear of edge fades and shadows
+    if O - 2 * q < 3:
+        return O // 2
+    diff = cv2.absdiff(gray(prev_ov), gray(curr_ov)).mean(axis=1).astype(np.float32)
+    k = max(1, min(band, (O - 2 * q) // 2)) | 1
+    smooth = cv2.blur(diff.reshape(-1, 1), (1, k)).ravel()
+    rows = np.arange(q, O - q)
+    cost = smooth[rows] + 1e-3 * np.abs(rows - O // 2)   # tiny pull toward the middle
+    return int(rows[np.argmin(cost)])
+
 # ---------- main stitcher ----------
 
 def stitch_images(files, output: str,
@@ -384,6 +605,7 @@ def stitch_images(files, output: str,
                   overlap_accept_ratio: float = 0.05,
                   guard: int = 0, prefer: str = "earlier", feather: int = 0,
                   crop_right: int = 0, crop_bottom: int = 0, ignore_perp: int = 0,
+                  window: bool = False, content_only: bool = False, fixed_cols=(),
                   sticky: bool = False, sticky_top: int = -1, sticky_bottom: int = -1,
                   no_shift: bool = False, no_overlap: bool = False,
                   edges: bool = False, multiscale: bool = True,
@@ -404,18 +626,43 @@ def stitch_images(files, output: str,
     # Load -> permanent crop (real coords) -> work frame (transpose if horizontal).
     # A single unreadable file is skipped, not fatal, so one stray file in a
     # folder doesn't abort the whole batch.
-    imgs = []
+    imgs, loaded = [], []
     for f in files:
         try:
             img = apply_crop(imread_rgb(f), crop_right, crop_bottom)
         except RuntimeError as e:
             logging.warning(f"skipping unreadable image: {e}")
             continue
-        imgs.append(to_work_frame(img, direction))
-        logging.debug(f"Loaded {os.path.basename(f)}: {imgs[-1].shape}")
+        imgs.append(img)
+        loaded.append(f)
+        logging.debug(f"Loaded {os.path.basename(f)}: {img.shape}")
     if len(imgs) < 2:
         print(f"Need at least 2 readable images to stitch (got {len(imgs)}).")
         return None
+
+    imgs = [to_work_frame(im, direction) for im in imgs]
+
+    # Whole-window frames: stitch only the scrolling region; the fixed UI around
+    # it is put back once at the end (unless content_only).
+    window = window or content_only
+    full, box, alphas, scrollbars = imgs, None, [None, None], []
+    if window:
+        box = detect_motion_box(imgs)
+        if box is None:
+            logging.warning("--window: no common scrolling region found "
+                            "(frames identical or differ in size); stitching whole frames")
+        else:
+            if fixed_cols:
+                box, scrollbars = apply_fixed_cols(box, fixed_cols, imgs[0].shape[1])
+            y0, y1, x0, x1 = box
+            logging.info(f"Scrolling region: rows {y0}..{y1}, cols {x0}..{x1} "
+                         f"(of {imgs[0].shape[0]}x{imgs[0].shape[1]}, work frame)")
+            imgs = [im[y0:y1, x0:x1] for im in imgs]
+            if not content_only:
+                # transparency (rounded window corners) of the frames the fixed
+                # UI is taken from
+                alphas = [imread_alpha(f, crop_right, crop_bottom) for f in (loaded[0], loaded[-1])]
+                alphas = [to_work_frame(a, direction) if a is not None else None for a in alphas]
 
     # Normalize perpendicular extent (work-frame width) so seams line up.
     common_w = max(img.shape[1] for img in imgs)
@@ -467,9 +714,11 @@ def stitch_images(files, output: str,
                  f"(direction={direction}). max_shift={actual_max_shift}, edges={edges}, "
                  f"search={'coarse-to-fine' if multiscale else 'exhaustive'}")
 
-    stitched = None if dry_run else imgs[0].copy()
+    # Pass 1: measure every seam. Pass 2 assembles, after the window crop has been
+    # refined with what the seams revealed.
     quality_scores = []
     low_seams = []
+    aligns = []
     for i in range(1, len(imgs)):
         prev, curr = imgs[i - 1], imgs[i]
 
@@ -509,9 +758,13 @@ def stitch_images(files, output: str,
 
         if debug:
             save_debug(prev, curr, accepted_shift, accepted_overlap, i, direction, debug_dir)
+        aligns.append((accepted_shift, accepted_overlap))
 
+    stitched = None if dry_run else imgs[0].copy()
+    for i, (accepted_shift, accepted_overlap) in enumerate(aligns, start=1):
         if dry_run:
-            continue
+            break
+        curr = imgs[i]
 
         # place curr in stitched coordinates
         curr_x = prev_x + accepted_shift
@@ -535,6 +788,13 @@ def stitch_images(files, output: str,
             tail = curr_padded[O:, :]
             if tail.size:
                 stitched = np.vstack((stitched, tail))
+        elif prefer == "middle":
+            # cut away from the overlap's ends (keeps frame edges with fades or
+            # shadows out of the seam), where the frames agree best
+            keep = seam_row(stitched[-O:], curr_padded[:O]) if O > 0 else 0
+            if O - keep > 0:
+                stitched = stitched[:stitched.shape[0] - (O - keep)]
+            stitched = np.vstack((stitched, curr_padded[keep:, :]))
         elif prefer == "earlier":
             cut = min(curr_padded.shape[0], accepted_overlap + guard)
             tail = curr_padded[cut:, :]
@@ -558,11 +818,19 @@ def stitch_images(files, output: str,
         prev_x = curr_x
 
     if not dry_run:
+        alpha = None
+        if box is not None and not content_only:
+            stitched, alpha = compose_window(full[0], full[-1], stitched, box, *alphas,
+                                            blank_cols=scrollbars)
         stitched = to_work_frame(stitched, direction)  # transpose back for horizontal
+        if alpha is not None:
+            stitched = np.dstack([stitched, to_work_frame(alpha, direction)])
         out_parent = os.path.dirname(os.path.abspath(output))
         if out_parent:
             os.makedirs(out_parent, exist_ok=True)
-        if not cv2.imwrite(output, stitched):
+        # OpenCV's default PNG settings are ~5x larger than zlib level 6 for screenshots
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 6] if output.lower().endswith(".png") else []
+        if not cv2.imwrite(output, stitched, params):
             raise RuntimeError(f"could not write '{output}' "
                                f"(check the path, extension, and permissions)")
         logging.info(f"Saved {output}  ({stitched.shape[1]} x {stitched.shape[0]})")
@@ -615,7 +883,9 @@ Examples:
                    help="relative MSE improvement over min-overlap to accept an overlap")
 
     p.add_argument("--guard", type=int, default=0, help="extra px removed at the seam")
-    p.add_argument("--prefer", choices=["earlier", "later"], default="earlier")
+    p.add_argument("--prefer", choices=["earlier", "later", "middle"], default="earlier",
+                   help="which frame's pixels fill the overlap; 'middle' cuts mid-overlap, "
+                        "keeping frame edges (fades, shadows) out of the seam")
     p.add_argument("--feather", type=int, default=0, metavar="N",
                    help="blend an N-px transition across each seam (hides faint seam lines)")
 
@@ -627,6 +897,25 @@ Examples:
                    type=int, default=0,
                    help="ignore px on the trailing perpendicular edge during matching "
                         "(e.g. macOS scrollbar/thumbnail)")
+    p.add_argument("--window", action="store_true",
+                   help="frames are whole-window captures: stitch only the region that "
+                        "scrolls and keep the fixed UI (toolbars, sidebars, scrollbar) once")
+    p.add_argument("--content-only", action="store_true",
+                   help="like --window, but drop the fixed UI and output only the "
+                        "scrolled content")
+    def col_range(s):
+        try:
+            a, b = (int(v) for v in s.split(":"))
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected A:B (two integers), got {s!r}")
+        if not 0 <= a < b:
+            raise argparse.ArgumentTypeError(f"expected 0 <= A < B, got {s!r}")
+        return a, b
+
+    p.add_argument("--fixed-cols", action="append", default=[], metavar="A:B", type=col_range,
+                   help="with --window: px range A..B across the stitch axis (columns "
+                        "for vertical) that is fixed UI even though it changes, e.g. a "
+                        "scrollbar; kept once instead of stitched. Repeatable")
 
     p.add_argument("--sticky", action="store_true",
                    help="auto-detect & de-duplicate fixed headers/footers repeated in every shot")
@@ -669,7 +958,8 @@ Examples:
             overlap_accept_ratio=args.overlap_accept_ratio,
             guard=args.guard, prefer=args.prefer, feather=args.feather,
             crop_right=args.crop_right, crop_bottom=args.crop_bottom,
-            ignore_perp=args.ignore_perp,
+            ignore_perp=args.ignore_perp, window=args.window, content_only=args.content_only,
+            fixed_cols=args.fixed_cols,
             sticky=args.sticky, sticky_top=args.sticky_top, sticky_bottom=args.sticky_bottom,
             no_shift=args.no_shift, no_overlap=args.no_overlap,
             edges=args.edges, multiscale=args.multiscale,

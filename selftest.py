@@ -84,6 +84,14 @@ def test_overlap_and_shift():
         check(f"overlap recovered with shift (dx={dx})", abs(a["overlap"] - OV) <= 3,
               f"got {a['overlap']}, want {OV}")
 
+    # tall frames take the 4x-downscaled coarse path (scroll captures)
+    T = make_master(3000, 700, seed=19)
+    for ov in (90, 500, 850):
+        prev, curr = T[0:900], T[900 - ov:1800 - ov]
+        a = stitch.detect_alignment(prev, curr, min_overlap=50, max_overlap=100000, max_shift=0)
+        check(f"overlap recovered on 900-row frames (ov={ov})", a["overlap"] == ov,
+              f"got {a['overlap']}, want {ov}")
+
 
 def test_ignore_perp_chrome():
     print("Unit: --ignore-perp excludes a differing edge stripe from the match")
@@ -337,6 +345,212 @@ def test_sticky():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def make_window_frames(with_scrollbar, fade=0, thumb=(0, 0, 255), th=30, count=None):
+    """Whole-window frames: header / [sidebar | scrolling content] / footer, plus
+    a tiny spinner in the header that changes every frame. `with_scrollbar`
+    draws an overlay thumb (macOS style) over the content's right edge, moving
+    with scroll progress. `fade` dims that many content rows under the header
+    and above the footer, as scroll views do under pinned bars."""
+    HH, FH, SW, VH, OV, W, SB, TH = 50, 30, 120, 320, 120, 420, 14, th
+    S = make_master(1500, W, seed=55)
+    header = make_chrome(SW + W, HH, seed=3)
+    footer = make_chrome(SW + W, FH, seed=4)
+    sidebar = make_chrome(SW, VH, seed=5)
+    step = VH - OV
+    n = count or (S.shape[0] - VH) // step + 1
+    frames = []
+    for k in range(n):
+        y = k * step
+        h = header.copy()
+        h[10:22, 10:22] = (40 * k) % 256          # spinner
+        view = S[y:y + VH].copy()
+        if fade:
+            view[:fade] = (view[:fade] * 0.5).astype(np.uint8)
+            view[-fade:] = (view[-fade:] * 0.5).astype(np.uint8)
+        if with_scrollbar:
+            t = int((VH - TH) * k / max(1, n - 1))
+            view[t:t + TH, W - SB + 3:W - 3] = thumb
+        frames.append(np.vstack([h, np.hstack([sidebar, view]), footer]))
+    covered = (n - 1) * step + VH
+    return dict(frames=frames, S=S, header=header, footer=footer, sidebar=sidebar,
+                HH=HH, FH=FH, SW=SW, VH=VH, W=W, SB=SB, TH=TH, covered=covered)
+
+
+def test_window():
+    print("Window: whole-window frames -> scrolling region stitched, fixed UI kept once")
+    d = make_window_frames(with_scrollbar=False)
+    frames, S, HH, SW, VH, W = d["frames"], d["S"], d["HH"], d["SW"], d["VH"], d["W"]
+
+    box = stitch.detect_motion_box(frames)
+    ok_box = box is not None
+    if ok_box:
+        y0, y1, x0, x1 = box
+        inside = HH <= y0 < y1 <= HH + VH and SW <= x0 < x1 <= SW + W
+        coverage = (y1 - y0) * (x1 - x0) / (VH * W)
+        check("window: box excludes header, footer, sidebar and spinner", inside, f"box={box}")
+        check("window: box covers most of the scrolling area", coverage > 0.85,
+              f"coverage={coverage:.2f}")
+    else:
+        check("window: box detected", False)
+    check("window: identical frames -> no box", stitch.detect_motion_box([frames[0]] * 3) is None)
+    check("window: mismatched sizes -> no box",
+          stitch.detect_motion_box([frames[0], frames[1][:-5]]) is None)
+
+    tmp = tempfile.mkdtemp(prefix="stitch_window_")
+    outdir = tempfile.mkdtemp(prefix="stitch_window_out_")
+    try:
+        for i, f in enumerate(frames):
+            cv2.imwrite(os.path.join(tmp, f"f_{i:02d}.png"), f)
+        if ok_box:
+            ry0, ry1 = y0 - HH, y1 - HH               # box rows within the viewport
+            body = S[ry0:d["covered"] - (VH - ry1), x0 - SW:x1 - SW]
+
+            out = os.path.join(outdir, "content.png")
+            ok = run_cli(tmp, out, ["--content-only", "--no-shift"])
+            res = cv2.imread(out)
+            check("window: --content-only reconstructs only the scrolled content",
+                  ok and res is not None and res.shape == body.shape and stitch.mse(res, body) < 1.0,
+                  None if res is None else f"{res.shape} vs {body.shape}"
+                  + (f", MSE={stitch.mse(res, body):.2f}" if res.shape == body.shape else ""))
+
+            out = os.path.join(outdir, "window.png")
+            ok = run_cli(tmp, out, ["--window", "--no-shift"])
+            res = cv2.imread(out)
+            ref, _ = stitch.compose_window(frames[0], frames[-1], body, box)
+            check("window: fixed UI kept once around the content",
+                  ok and res is not None and res.shape == ref.shape and stitch.mse(res, ref) < 1.0,
+                  None if res is None else f"{res.shape} vs {ref.shape}")
+            check("window: header from first frame, footer from last",
+                  res is not None and res.shape == ref.shape
+                  and stitch.mse(res[:HH], frames[0][:HH]) < 1.0
+                  and stitch.mse(res[-d["FH"]:], d["footer"]) < 1.0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
+def test_window_fixed_cols():
+    print("Window: a scrollbar declared with --fixed-cols is not stitched into the content")
+    d = make_window_frames(with_scrollbar=True)
+    frames, TH, SW, W, SB = d["frames"], d["TH"], d["SW"], d["W"], d["SB"]
+    bar = f"{SW + W - SB}:{SW + W}"                   # thumb columns, as the OS reports them
+
+    def red_rows(img):
+        red = (img[:, :, 2] > 200) & (img[:, :, 1] < 60) & (img[:, :, 0] < 60)
+        return int(red.any(axis=1).sum())
+
+    tmp = tempfile.mkdtemp(prefix="stitch_fixed_")
+    outdir = tempfile.mkdtemp(prefix="stitch_fixed_out_")
+    try:
+        for i, f in enumerate(frames):
+            cv2.imwrite(os.path.join(tmp, f"f_{i:02d}.png"), f)
+        run = lambda name, extra: (run_cli(tmp, os.path.join(outdir, name), extra),
+                                   cv2.imread(os.path.join(outdir, name)))
+        ok, res = run("plain.png", ["--window", "--no-shift"])
+        check("fixed-cols: without it, an overlay thumb repeats (why the flag exists)",
+              ok and res is not None and red_rows(res) > TH,
+              None if res is None else f"{red_rows(res)} red rows")
+        ok, res = run("window.png", ["--window", "--no-shift", "--fixed-cols", bar])
+        check("fixed-cols: --window shows the track without any thumb (nothing left to scroll)",
+              ok and res is not None and red_rows(res) == 0,
+              None if res is None else f"{red_rows(res)} red rows")
+        check("fixed-cols: window keeps its full width",
+              res is not None and res.shape[1] == frames[0].shape[1])
+        ok, res = run("content.png", ["--content-only", "--no-shift", "--fixed-cols", bar])
+        check("fixed-cols: --content-only has no thumb",
+              ok and res is not None and red_rows(res) == 0,
+              None if res is None else f"{red_rows(res)} red rows")
+        # a short page: the thumb fills most of the track in both frames
+        for f in os.listdir(tmp):
+            os.remove(os.path.join(tmp, f))
+        short = make_window_frames(with_scrollbar=True, th=200, count=2)
+        for i, f in enumerate(short["frames"]):
+            cv2.imwrite(os.path.join(tmp, f"f_{i:02d}.png"), f)
+        ok, res = run("short.png", ["--window", "--no-shift", "--fixed-cols", bar])
+        check("fixed-cols: tall thumb on a 2-frame page -> track colour, no thumb stripe",
+              ok and res is not None and red_rows(res) == 0,
+              None if res is None else f"{red_rows(res)} red rows")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "stitch.py"), tmp, "-o",
+                            os.path.join(outdir, "bad.png"), "--window", "--fixed-cols", "12"],
+                           capture_output=True, text=True)
+        check("fixed-cols: malformed value -> clear error, non-zero exit",
+              r.returncode != 0 and "expected A:B" in r.stderr, r.stderr.strip()[-80:])
+        for f in os.listdir(tmp):
+            os.remove(os.path.join(tmp, f))
+        for i, f in enumerate(frames):
+            cv2.imwrite(os.path.join(tmp, f"f_{i:02d}.png"), f)
+
+        ok, res = run("outside.png", ["--window", "--no-shift", "--fixed-cols", "0:40"])
+        ok2, ref = run("plain2.png", ["--window", "--no-shift"])
+        check("fixed-cols: a range outside the scrolling region changes nothing",
+              ok and ok2 and res is not None and ref is not None and res.shape == ref.shape
+              and stitch.mse(res, ref) < 0.01)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
+def test_pinned_bottom():
+    print("Window: side panes - pinned bottom controls move down, lists stay whole")
+    bg = np.full((400, 60, 3), 230, np.uint8)
+    side = bg.copy(); side[20:200:20, 5:50] = 40; side[372:388, 20:40] = 40   # items + a button at the foot
+    lst = bg.copy(); lst[5:395:12, 5:55] = 40                                 # a list down to the bottom
+    check("pinned: button below empty space is found", stitch.pinned_bottom(side) == 372,
+          f"got {stitch.pinned_bottom(side)}")
+    check("pinned: a list running to the bottom is left whole", stitch.pinned_bottom(lst) == 400,
+          f"got {stitch.pinned_bottom(lst)}")
+    check("pinned: an empty pane has nothing to move", stitch.pinned_bottom(bg) == 400)
+
+
+def test_window_alpha():
+    print("Window: transparent rounded corners stay transparent, never smear down the sides")
+    d = make_window_frames(with_scrollbar=False)
+    R = 12
+    frames = []
+    for f in d["frames"]:
+        f = f[:-d["FH"]]                                  # no bottom bar: content reaches the window's bottom
+        a = np.full(f.shape[:2], 255, np.uint8)
+        yy, xx = np.mgrid[0:R, 0:R]
+        outside = (yy - R) ** 2 + (xx - R) ** 2 > R * R   # rounded-corner mask
+        for ys, xs in ((slice(0, R), slice(0, R)), (slice(0, R), slice(-R, None)),
+                       (slice(-R, None), slice(0, R)), (slice(-R, None), slice(-R, None))):
+            m = outside[::1 if ys.start == 0 else -1, ::1 if xs.start == 0 else -1]
+            a[ys, xs][m] = 0
+        bgra = np.dstack([f, a])
+        bgra[a == 0] = 0                                  # screencapture leaves black under alpha 0
+        frames.append(bgra)
+    tmp = tempfile.mkdtemp(prefix="stitch_alpha_")
+    outdir = tempfile.mkdtemp(prefix="stitch_alpha_out_")
+    try:
+        for i, f in enumerate(frames):
+            cv2.imwrite(os.path.join(tmp, f"f_{i:02d}.png"), f)
+        for prefer in ("earlier", "middle"):
+            out = os.path.join(outdir, f"w-{prefer}.png")
+            ok = run_cli(tmp, out, ["--window", "--no-shift", "--prefer", prefer])
+            res = cv2.imread(out, cv2.IMREAD_UNCHANGED)
+            good = ok and res is not None and res.ndim == 3 and res.shape[2] == 4
+            check(f"alpha ({prefer}): output keeps an alpha channel", good,
+                  None if res is None else f"shape {res.shape}")
+            if good:
+                h = res.shape[0]
+                corners = [res[0, 0, 3], res[0, -1, 3], res[-1, 0, 3], res[-1, -1, 3]]
+                check(f"alpha ({prefer}): all four corners transparent",
+                      all(c == 0 for c in corners), f"{corners}")
+                check(f"alpha ({prefer}): interior fully opaque", (res[R:h - R, R:-R, 3] == 255).all())
+                side = res[R:h - R, :3, :3]                 # left edge of the sidebar column
+                check(f"alpha ({prefer}): no black smear down the side below the first frame",
+                      int((side.max(axis=2) < 20).sum()) == 0,
+                      f"{int((side.max(axis=2) < 20).sum())} near-black px")
+        out2 = os.path.join(outdir, "c.png")
+        ok = run_cli(tmp, out2, ["--content-only", "--no-shift"])
+        res2 = cv2.imread(out2, cv2.IMREAD_UNCHANGED)
+        check("alpha: --content-only output stays opaque BGR",
+              ok and res2 is not None and res2.ndim == 3 and res2.shape[2] == 3)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
 def test_feather():
     print("Feather: actually blends differing overlap content (not a no-op)")
     tmp = tempfile.mkdtemp(prefix="stitch_feather_")
@@ -541,6 +755,54 @@ def test_prefer_later():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_prefer_middle():
+    print("Prefer: 'middle' keeps faded frame edges out of the seams")
+    tmp = tempfile.mkdtemp(prefix="stitch_middle_")
+    try:
+        TH, OV, FADE = 360, 140, 25
+        M = make_master(1500, 480, seed=61)
+        tiles, covered = slice_vertical(M, TH, OV)
+        last = len(tiles) - 1
+        for i, t in enumerate(tiles):
+            # scroll views often fade content under pinned bars: dim the edges
+            # that sit inside an overlap (not the page's own top/bottom)
+            if i > 0:
+                t[:FADE] = (t[:FADE] * 0.5).astype(np.uint8)
+            if i < last:
+                t[-FADE:] = (t[-FADE:] * 0.5).astype(np.uint8)
+            cv2.imwrite(os.path.join(tmp, f"t_{i:02d}.png"), t)
+        ref = M[:covered]
+        outdir = tempfile.mkdtemp(prefix="stitch_middle_out_")   # outside the input folder
+        mid, early = os.path.join(outdir, "mid.png"), os.path.join(outdir, "early.png")
+        ok1 = run_cli(tmp, mid, ["--prefer", "middle", "--no-shift"])
+        ok2 = run_cli(tmp, early, ["--prefer", "earlier", "--no-shift"])
+        rm, re_ = cv2.imread(mid), cv2.imread(early)
+        check("prefer middle: reconstructs master with no fade bands",
+              ok1 and rm is not None and rm.shape == ref.shape and stitch.mse(rm, ref) < 1.0,
+              None if rm is None else f"{rm.shape} vs {ref.shape}"
+              + (f", MSE={stitch.mse(rm, ref):.2f}" if rm.shape == ref.shape else ""))
+        check("prefer earlier: keeps fade bands (control)",
+              ok2 and re_ is not None and re_.shape == ref.shape and stitch.mse(re_, ref) > 5.0,
+              None if re_ is None else f"MSE={stitch.mse(re_, ref):.2f}" if re_.shape == ref.shape
+              else f"{re_.shape} vs {ref.shape}")
+        shutil.rmtree(outdir, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_seam_row():
+    print("Seam: --prefer middle cuts where the frames agree, avoiding animated content")
+    M = make_master(800, 300, seed=77)
+    ov = M[100:500].copy()                                  # a 400-row overlap
+    check("seam: identical overlap -> exact middle", stitch.seam_row(ov, ov.copy()) == 200,
+          f"got {stitch.seam_row(ov, ov.copy())}")
+    changed = ov.copy()
+    changed[120:300] = 255 - changed[120:300]               # an animation changed this block
+    r = stitch.seam_row(ov, changed)
+    check("seam: cut avoids the changed block", not 120 <= r < 300, f"cut at {r}")
+    check("seam: cut stays clear of the overlap's ends", 24 <= r <= 376, f"cut at {r}")
+
+
 def test_quality_calibration():
     print("Quality: calibration thresholds (high<300<medium<1500<low MSE)")
     W, OV = 200, 120
@@ -618,12 +880,18 @@ def main():
     test_cli_flags()
     test_inputs_and_naming()
     test_sticky()
+    test_window()
+    test_window_fixed_cols()
+    test_pinned_bottom()
+    test_window_alpha()
     test_feather()
     test_dry_run()
     test_strict()
     test_no_overlap_honesty()
     test_adversarial()
     test_prefer_later()
+    test_prefer_middle()
+    test_seam_row()
     test_quality_calibration()
     test_ignore_perp_cli()
     test_loose_file_naming()
