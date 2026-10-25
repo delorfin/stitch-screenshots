@@ -225,6 +225,13 @@ success and shows an alert only on failure. Frames are deleted after each
 capture; a failed one keeps them in `$TMPDIR` for a look, and the next capture
 removes such leftovers once they're a day old.
 
+**From a launcher:** `open -g hammerspoon://scroll-capture` starts a capture
+too. It waits `URL_DELAY` (0.3 s) so the launcher's window can close and the
+target window is frontmost again. For Raycast, `raycast/scroll-capture.sh` is a
+ready script command: add the `raycast/` folder under Raycast Settings →
+Extensions → Script Commands, or copy the file into a script directory you
+already have.
+
 **Settings** at the top of the script: `CONTENT_ONLY` (drop the window's fixed
 UI), `STEP_FRAC` (scroll step as a share of the window height), and timing.
 

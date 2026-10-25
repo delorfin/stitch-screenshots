@@ -1,5 +1,6 @@
 -- Scrolling screenshot of the frontmost window.
--- ctrl+cmd+shift+2 starts; Esc (or the hotkey again) stops early. Otherwise it
+-- ctrl+cmd+shift+2 or `open -g hammerspoon://scroll-capture` starts; Esc (or the
+-- hotkey again) stops early. Otherwise it
 -- scrolls until the content stops moving, then stitches the frames with
 -- ../stitch.py --window and saves to ~/Downloads + the clipboard.
 -- Silent on success; alerts only on failure.
@@ -15,6 +16,7 @@ local HOLD = 0.1          -- pause before "lifting the finger", so nothing fling
 local POLL = 0.15         -- seconds between captures while waiting for the view to settle
 local MAX_WAIT = 3        -- seconds to wait for a frame to settle before taking it as is
 local ANIMATED_WAIT = 1.2 -- once a frame never settled (an animation), wait only this long
+local URL_DELAY = 0.3     -- seconds before a URL-triggered capture, so the launcher can close
 
 local log = hs.logger.new("scrollcap", "info")
 
@@ -342,5 +344,11 @@ startCapture = function()
 end
 
 hs.hotkey.bind({"ctrl", "cmd", "shift"}, "2", M.start)
+
+-- `open -g hammerspoon://scroll-capture` (e.g. from a Raycast script command).
+-- The delay lets the launcher close so the target window is frontmost again.
+hs.urlevent.bind("scroll-capture", function()
+    hs.timer.doAfter(URL_DELAY, M.start)
+end)
 
 return M
